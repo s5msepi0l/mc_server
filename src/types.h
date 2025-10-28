@@ -7,8 +7,13 @@
 
 #define VARINT_MAX_N 5 // maximum varint size
 
+using UUID = std::array<u8, 16>;
+
 enum class Packet_id : u8 {
-    // handshaking
+    SETUP = 0x00,
+    PING = 0x01,
+
+    /*// handshaking
     HANDSHAKE =       0x00,
     STATUS_REQUEST =  0X00,
     STATUS_RESPONSE = 0X01,
@@ -21,7 +26,7 @@ enum class Packet_id : u8 {
     ENCRYPTION_RESPONSE =  0x02,
     LOGIN_SUCCESS =        0x02,
     SET_COMPRESSION =      0x03,
-    LOGIN_PLUGIN_REQUEST = 0x04,
+    LOGIN_PLUGIN_REQUEST = 0x04,*/
 };
 
 u8 read_byte(i32 fd) {
@@ -52,7 +57,7 @@ void write_byte(i32 fd, u8 byte) {
 //https://minecraft.wiki/w/Java_Edition_protocol/Packets#VarInt_and_VarLong
 
 
-i32 read_varint_b(u8 *buffer, u32 &offset) {
+i32 read_varint_b(u8 *buffer, i32 &offset) {
     i32 value = 0;
     i32 position = 0;
     u8 current_byte;
@@ -74,7 +79,7 @@ i32 read_varint_b(u8 *buffer, u32 &offset) {
     return value;
 }
 
-i64 read_varlong_b(u8 *buffer, u32 &offset) {
+i64 read_varlong_b(u8 *buffer, i32 &offset) {
     i64 value = 0;
     i32 position = 0;
     u8 current_byte;
@@ -95,6 +100,14 @@ i64 read_varlong_b(u8 *buffer, u32 &offset) {
     }
 
     return value;
+}
+
+i32 varint_len(i32 value) {
+    i32 len = 0;
+    do {
+        len++;
+        value >>= 7;
+    } while(value != 0 && value != -1);
 }
 
 void write_varint(i32 fd, i32 value) {
@@ -123,6 +136,46 @@ void write_varlong(i32 fd, i64 value) {
     }
 }
 
+i64 write_string(i32 fd, std::string value) {
+    write_varint(fd, value.size());
+    return write(fd, value.data(), value.size());
+}
+
+std::string entry_to_string(u8 *message, i32 &offset) {
+    i32 strlen = read_varint_b(message, offset);
+    char buffer[strlen];
+
+    for (i32 i = 0; i < strlen; i++) {
+        buffer[i] = message[offset++];
+    }
+
+    return std::string(buffer, strlen);
+}
+
+void write_uuid(i32 fd, UUID uuid) {
+    write(fd, uuid.data(), uuid.size());
+}
+
+UUID read_uuid(u8 *buffer, i32 &offset) {
+    UUID uuid;
+    std::copy_n(buffer + offset, 16, uuid.begin());
+
+    offset += 16;
+    return uuid;
+}
+
+std::string uuid_to_string(const UUID& uuid) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+
+    for (i32 i = 0; i < 16; i++) {
+        oss << std::setw(2) << static_cast<i32>(uuid[i]);
+        if (i == 3 || i == 5 || i == 7 || i == 9)
+            oss << '-';
+    }
+
+    return oss.str();
+}
 
 // thank you sweet sweet ai overlords
 int8_t entry_to_byte(uint8_t* message, int32_t& offset) {

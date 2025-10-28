@@ -76,9 +76,11 @@ class Server {
                     std::lock_guard lockClient(client_connect);
 
                     std::shared_ptr<Client> client = std::make_shared<Client>(client_fd);
+                    client->set_state(Client_state::handshaking);
+
                     connected_clients.push_back(client);
 
-                    std::jthread client_thread(&Client::handle_client, client);
+                    std::jthread client_thread(&Client::handle_client, client.get(), client_fd);
                     client_thread.detach();
                 }
             }

@@ -5,6 +5,9 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
+#include <array>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -16,6 +19,9 @@
 #include <mutex>
 #include <thread>
 
+#include "../lib/json.hpp"
+
+using json = nlohmann::json;
 
 #define i8  int8_t
 #define i16 int16_t
