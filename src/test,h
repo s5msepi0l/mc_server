@@ -1,0 +1,200 @@
+#pragma once
+
+#include <iostream>
+#include <vector>
+#include <stdint.h>
+
+struct ProtocolConfig {
+    // minecraft:level_chunk_with_light (Play, clientbound). Get the real value for
+    // your version from packets.json (java -DbundlerMainClass=net.minecraft.data.Main
+    // -jar server.jar --reports).
+    int32_t chunkPacketId = 0x27;
+
+    // ceil(log2(number of block states)) for your version. 15 for current versions.
+    // The client uses its own value in direct mode, so this must be right.
+    int blockStateBits = 15;
+};
+
+namespace detail {
+
+struct Writer {
+    std::vector<uint8_t> b;
+    void u8(uint8_t v) { b.push_back(v); }
+    void i16(int16_t v) { u8(uint8_t(v >> 8)); u8(uint8_t(v)); }
+    void i32(int32_t v) { for (int i = 3; i >= 0; --i) u8(uint8_t(v >> (i * 8))); }
+    void u64(uint64_t v) { for (int i = 7; i >= 0; --i) u8(uint8_t(v >> (i * 8))); }
+    void varint(int32_t v) {
+        uint32_t u = uint32_t(v);
+        while (u & ~0x7Fu) { u8(uint8_t((u & 0x7F) | 0x80)); u >>= 7; }
+        u8(uint8_t(u));
+    }
+    void append(const Writer& o) { b.insert(b.end(), o.b.begin(), o.b.end()); }
+    size_t size() const { return b.size(); }
+};
+
+inline bool sendAll(int fd, const uint8_t* p, size_t n) {
+    while (n > 0) {
+#ifdef MSG_NOSIGNAL
+        ssize_t r = ::send(fd, p, n, MSG_NOSIGNAL);
+#else
+        ssize_t r = ::send(fd, p, n, 0);
+#endif
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false; // includes EAGAIN on non-blocking fds (see notes)
+        }
+        p += r;
+        n -= size_t(r);
+    }
+    return true;
+}
+
+} // namespace detail
+
+// A 16x16 column covering world Y [minY, minY + height).
+// x and z are LOCAL (0..15). y is the WORLD Y.
+//
+// Storage is one flat array indexed (relY * 16 + z) * 16 + x. Because the protocol
+// orders blocks inside a section as (localY * 16 + z) * 16 + x, each section is just
+// a contiguous run of 4096 entries in this array.
+class Chunk {
+public:
+    Chunk(int32_t chunkX, int32_t chunkZ, int minY = -64, int height = 384,
+          uint16_t airId = 0, uint32_t biomeId = 0)
+        : cx_(chunkX), cz_(chunkZ), minY_(minY), height_(height),
+          air_(airId), biome_(biomeId),
+          blocks_(size_t(height) * 256, airId) {
+        if (height <= 0 || height % 16 != 0)
+            throw std::invalid_argument("height must be a positive multiple of 16");
+    }
+
+    // world block coord -> chunk coord / local coord (both correct for negatives)
+    static int toChunk(int worldCoord) { return worldCoord >> 4; }
+    static int toLocal(int worldCoord) { return worldCoord & 15; }
+
+    int32_t chunkX() const { return cx_; }
+    int32_t chunkZ() const { return cz_; }
+    int minY() const { return minY_; }
+    int height() const { return height_; }
+    uint16_t airId() const { return air_; }
+
+    bool inBounds(int x, int y, int z) const {
+        return unsigned(x) < 16u && unsigned(z) < 16u && y >= minY_ && y < minY_ + height_;
+    }
+
+    // Out-of-bounds reads return air.
+    uint16_t getBlock(int x, int y, int z) const {
+        return inBounds(x, y, z) ? blocks_[index(x, y, z)] : air_;
+    }
+
+    // Returns false if out of bounds.
+    bool setBlock(int x, int y, int z, uint16_t stateId) {
+        if (!inBounds(x, y, z)) return false;
+        blocks_[index(x, y, z)] = stateId;
+        return true;
+    }
+
+    bool isAir(int x, int y, int z) const { return getBlock(x, y, z) == air_; }
+
+    // Set one whole horizontal layer (256 blocks) at world Y.
+    void fillLayer(int y, uint16_t stateId) {
+        if (y < minY_ || y >= minY_ + height_) return;
+        for (int z = 0; z < 16; ++z)
+            for (int x = 0; x < 16; ++x) blocks_[index(x, y, z)] = stateId;
+    }
+
+    // Set every block in the chunk.
+    void fill(uint16_t stateId) { blocks_.assign(blocks_.size(), stateId); }
+
+    // Direct access to the flat array (relY*256 + z*16 + x) if you want to bulk-write.
+    uint16_t* raw() { return blocks_.data(); }
+
+    // -----------------------------------------------------------------------
+    // Build the fully framed packet: VarInt length | VarInt id | payload
+    // -----------------------------------------------------------------------
+    std::vector<uint8_t> buildPacket(const ProtocolConfig& cfg) const {
+        using detail::Writer;
+        const int nSections = height_ / 16;
+
+        // ---- section data ----
+        // Direct palette: entries are real state IDs, packed 64/bits per long,
+        // never spanning two longs, lowest bits first, each long sent big-endian.
+        const int bits = cfg.blockStateBits;
+        const int perLong = 64 / bits;
+        const int nLongs = (4096 + perLong - 1) / perLong;
+
+        Writer data;
+        for (int s = 0; s < nSections; ++s) {
+            const uint16_t* blk = &blocks_[size_t(s) * 4096];
+
+            int nonAir = 0;
+            for (int i = 0; i < 4096; ++i) nonAir += (blk[i] != air_);
+            data.i16(int16_t(nonAir));
+
+            // block states (paletted container, direct)
+            data.u8(uint8_t(bits));          // bits per entry
+            //                               // (no palette in direct mode)
+            //                               // (no array-length prefix on 1.21.5+)
+            for (int l = 0; l < nLongs; ++l) {
+                uint64_t v = 0;
+                for (int e = 0; e < perLong; ++e) {
+                    int i = l * perLong + e;
+                    if (i >= 4096) break;
+                    v |= uint64_t(blk[i]) << (e * bits);
+                }
+                data.u64(v);
+            }
+
+            // biomes (paletted container, single-valued)
+            data.u8(0);
+            data.varint(int32_t(biome_));
+        }
+
+        // ---- packet body ----
+        Writer body;
+        body.varint(cfg.chunkPacketId);
+        body.i32(cx_);
+        body.i32(cz_);
+        body.varint(0);                       // heightmaps: empty array
+        body.varint(int32_t(data.size()));    // size of section data in bytes
+        body.append(data);
+        body.varint(0);                       // block entities: none
+
+        // ---- light: full-bright sky, no block light ----
+        const int lightSections = nSections + 2; // one extra above and below
+        if (lightSections > 64) throw std::runtime_error("more than 64 light sections");
+        const uint64_t all = (lightSections == 64) ? ~0ULL : ((1ULL << lightSections) - 1);
+
+        body.varint(1); body.u64(all);        // sky light mask: all sections have an array
+        body.varint(0);                       // block light mask: none
+        body.varint(0);                       // empty sky light mask: none
+        body.varint(1); body.u64(all);        // empty block light mask: all (zero light)
+        body.varint(lightSections);           // sky light arrays
+        for (int i = 0; i < lightSections; ++i) {
+            body.varint(2048);
+            body.b.insert(body.b.end(), 2048, 0xFF);
+        }
+        body.varint(0);                       // block light arrays: none
+
+        // ---- frame ----
+        Writer frame;
+        frame.varint(int32_t(body.size()));
+        frame.append(body);
+        return std::move(frame.b);
+    }
+
+    // Build and write to a blocking socket fd. Returns false on send error.
+    bool sendTo(int fd, const ProtocolConfig& cfg) const {
+        std::vector<uint8_t> pkt = buildPacket(cfg);
+        return detail::sendAll(fd, pkt.data(), pkt.size());
+    }
+
+private:
+    int32_t cx_, cz_;
+    int minY_, height_;
+    uint16_t air_;
+    uint32_t biome_;
+    std::vector<uint16_t> blocks_;
+
+    int index(int x, int y, int z) const { return ((y - minY_) * 16 + z) * 16 + x; }
+};

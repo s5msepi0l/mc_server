@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util.h"
+#include <stdint.h>
 
 #define SEGMENT_BITS 0x7F
 #define CONTINUE_BIT 0x80
@@ -42,7 +43,7 @@ u8 read_byte(i32 fd) {
     return byte;
 }
 
-void write_byte(i32 fd, u8 byte) {
+inline void write_byte(i32 fd, u8 byte) {
     i64 n = write(fd, &byte, 1);
     if (n < 0) {
         std::cerr << "write() failed\n";
@@ -52,7 +53,6 @@ void write_byte(i32 fd, u8 byte) {
         exit(EXIT_FAILURE);
     }
 }
-
 
 //https://minecraft.wiki/w/Java_Edition_protocol/Packets#VarInt_and_VarLong
 
@@ -248,3 +248,23 @@ double entry_to_double(uint8_t* message, int32_t& offset) {
     offset += 8; // Correctly increment offset by 8 for double
     return result;
 }
+
+
+/*
+for larger packets where its not really practical to calculate payload size ahead of time
+*/
+struct packet_framer {
+    std::vector<uint8_t> data;
+
+    void add_u8(uint8_t v) { data.push_back(v); }
+    void add_i16(int16_t v) { add_u8(uint8_t(v >> 8)); add_u8(uint8_t(v)); }
+    void add_i32(int32_t v) { for (int i = 3; i >= 0; --i) add_u8(uint8_t(v >> (i * 8))); }
+    void add_u64(uint64_t v) { for (int i = 7; i >= 0; --i) add_u8(uint8_t(v >> (i * 8))); }
+    void varint(int32_t v) {
+        uint32_t u = uint32_t(v);
+        while (u & ~0x7Fu) { add_u8(uint8_t((u & 0x7F) | 0x80)); u >>= 7; }
+        add_u8(uint8_t(u));
+    }
+    void append(const packet_framer& o) { data.insert(data.end(), o.data.begin(), o.data.end()); }
+    size_t size() const { return data.size(); }
+};
